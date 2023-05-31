@@ -22,6 +22,19 @@ target_link_libraries( plaintext_posix
                        PUBLIC
                            sockets_posix )
 
+add_library( mbedtls_posix
+             ${MBEDTLS_TRANSPORT_SOURCES} )
+
+target_link_libraries( mbedtls_posix
+                       PRIVATE
+                          mbedtls )
+target_include_directories(
+    mbedtls_posix
+    PUBLIC
+        ${COMMON_TRANSPORT_INCLUDE_PUBLIC_DIRS}
+        ${LOGGING_INCLUDE_DIRS}
+        ${TRANSPORT_INTERFACE_INCLUDE_DIR} )
+
 # Create target for POSIX implementation of OpenSSL.
 add_library( openssl_posix
                 ${OPENSSL_TRANSPORT_SOURCES} )
@@ -80,6 +93,7 @@ target_include_directories(
 if(INSTALL_PLATFORM_ABSTRACTIONS)
     install(TARGETS
       openssl_posix
+      mbedtls_posix
       plaintext_posix
       sockets_posix
       transport_mbedtls_pkcs11_posix
