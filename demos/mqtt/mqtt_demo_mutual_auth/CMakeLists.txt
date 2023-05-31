@@ -21,6 +21,7 @@ add_executable(
 target_link_libraries(
     ${DEMO_NAME}
     PRIVATE
+        Threads::Threads
         clock_posix
         openssl_posix
 )

@@ -52,9 +52,15 @@
 
 /* Standard includes. */
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+
+/* pthread include. */
+#include <pthread.h>
+#include <semaphore.h>
 
 /* POSIX includes. */
 #include <unistd.h>
@@ -205,11 +211,6 @@
 #define MQTT_PACKET_ID_INVALID                   ( ( uint16_t ) 0U )
 
 /**
- * @brief Timeout for MQTT_ProcessLoop function in milliseconds.
- */
-#define MQTT_PROCESS_LOOP_TIMEOUT_MS             ( 500U )
-
-/**
  * @brief The maximum time interval in seconds which is allowed to elapse
  *  between two Control Packets.
  *
@@ -250,7 +251,6 @@
  */
 #define METRICS_STRING_LENGTH                    ( ( uint16_t ) ( sizeof( METRICS_STRING ) - 1 ) )
 
-
 #ifdef CLIENT_USERNAME
 
 /**
@@ -273,6 +273,21 @@
  * library to track QoS > 0 packet ACKS for incoming publishes.
  */
 #define INCOMING_PUBLISH_RECORD_LEN    ( 10U )
+
+/**
+ * @brief Period for waiting on ack.
+ */
+#define MQTT_ACK_TIMEOUT_SEC           ( 5U )
+
+/**
+ * @brief Loop time for #MQTT_processLoop.
+ */
+#define MQTT_PROCESS_LOOP_TIME_USEC    ( 5000U )
+
+/**
+ * @brief Retry times for publish.
+ */
+#define MQTT_PUBLISH_RETRY_TIMES       ( 3U )
 
 /*-----------------------------------------------------------*/
 
@@ -358,6 +373,29 @@ static MQTTPubAckInfo_t pOutgoingPublishRecords[ OUTGOING_PUBLISH_RECORD_LEN ];
  */
 static MQTTPubAckInfo_t pIncomingPublishRecords[ INCOMING_PUBLISH_RECORD_LEN ];
 
+/**
+ * @brief Semaphore for synchronizing wait for ack.
+ */
+static sem_t ackSemaphore;
+
+/* Linkage for error reporting. */
+extern int errno;
+
+/**
+ * @brief Keep a flag for indicating if the MQTT connection is alive.
+ */
+static bool mqttSessionEstablished = false;
+
+/**
+ * @brief The mqtt process loop flag.
+ */
+static bool mqttProcessLoop = true;
+
+/**
+ * @brief Mutex for synchronizing coreMQTT API calls.
+ */
+static pthread_mutex_t mqttMutex;
+
 /*-----------------------------------------------------------*/
 
 /* Each compilation unit must define the NetworkContext struct. */
@@ -365,6 +403,16 @@ struct NetworkContext
 {
     OpensslParams_t * pParams;
 };
+
+/**
+ * @brief MQTT connection context used in this demo.
+ */
+MQTTContext_t mqttContext = { 0 };
+
+/**
+ * @brief Network connection context used in this demo.
+ */
+NetworkContext_t networkContext = { 0 };
 
 /*-----------------------------------------------------------*/
 
@@ -569,28 +617,18 @@ static int handleResubscribe( MQTTContext_t * pMqttContext );
  * #MQTT_ProcessLoop and waiting for #mqttCallback to set the global ACK
  * packet identifier to the expected ACK packet identifier.
  *
- * @param[in] pMqttContext MQTT context pointer.
- * @param[in] usPacketIdentifier Packet identifier for expected ACK packet.
- * @param[in] ulTimeout Maximum duration to wait for expected ACK packet.
- *
- * @return true if the expected ACK packet was received, false otherwise.
+ * @return EXIT_SUCCESS is successfully to wait ack;
+ * EXIT_FAILURE was not waiting for ack.
  */
-static int waitForPacketAck( MQTTContext_t * pMqttContext,
-                             uint16_t usPacketIdentifier,
-                             uint32_t ulTimeout );
+static int waitForPacketAck( void );
 
 /**
- * @brief Call #MQTT_ProcessLoop in a loop for the duration of a timeout or
- * #MQTT_ProcessLoop returns a failure.
+ * @brief Resend publish topic to mqtt broker.
  *
- * @param[in] pMqttContext MQTT context pointer.
- * @param[in] ulTimeoutMs Duration to call #MQTT_ProcessLoop for.
- *
- * @return Returns the return value of the last call to #MQTT_ProcessLoop.
+ * @return EXIT_SUCCESS is successfully to publish;
+ * EXIT_FAILURE means three times republish failed.
  */
-static MQTTStatus_t processLoopWithTimeout( MQTTContext_t * pMqttContext,
-                                            uint32_t ulTimeoutMs );
-
+static int mqttRepublish( void );
 
 /*-----------------------------------------------------------*/
 
@@ -816,7 +854,19 @@ static int handlePublishResend( MQTTContext_t * pMqttContext )
      * through for the associated packet ID. If the application requires
      * increased efficiency in the look up of the packet ID, then a hashmap of
      * packetId key and PublishPacket_t values may be used instead. */
-    packetIdToResend = MQTT_PublishToResend( pMqttContext, &cursor );
+
+    if( pthread_mutex_lock( &mqttMutex ) == 0 )
+    {
+        /* Send PUBLISH packet. */
+        packetIdToResend = MQTT_PublishToResend( pMqttContext, &cursor );
+        pthread_mutex_unlock( &mqttMutex );
+    }
+    else
+    {
+        LogError( ( "Failed to acquire mqtt mutex for executing MQTT_PublishToResend"
+                    ",errno=%s",
+                    strerror( errno ) ) );
+    }
 
     while( packetIdToResend != MQTT_PACKET_ID_INVALID )
     {
@@ -831,9 +881,25 @@ static int handlePublishResend( MQTTContext_t * pMqttContext )
 
                 LogInfo( ( "Sending duplicate PUBLISH with packet id %u.",
                            outgoingPublishPackets[ index ].packetId ) );
-                mqttStatus = MQTT_Publish( pMqttContext,
-                                           &outgoingPublishPackets[ index ].pubInfo,
-                                           outgoingPublishPackets[ index ].packetId );
+                if( pthread_mutex_lock( &mqttMutex ) == 0 )
+                {
+                    /* Send PUBLISH packet. */
+                    mqttStatus = MQTT_Publish( pMqttContext,
+                                               &outgoingPublishPackets[ index ].pubInfo,
+                                               outgoingPublishPackets[ index ].packetId );
+                    if( mqttStatus != MQTTSuccess )
+                    {
+                        LogError( ( "Failed to send PUBLISH packet to broker with error = %u.", mqttStatus ) );
+                    }
+                
+                    pthread_mutex_unlock( &mqttMutex );
+                }
+                else
+                {
+                    LogError( ( "Failed to acquire mqtt mutex for executing MQTT_Publish"
+                                ",errno=%s",
+                                strerror( errno ) ) );
+                }
 
                 if( mqttStatus != MQTTSuccess )
                 {
@@ -863,7 +929,18 @@ static int handlePublishResend( MQTTContext_t * pMqttContext )
         else
         {
             /* Get the next packetID to be resent. */
-            packetIdToResend = MQTT_PublishToResend( pMqttContext, &cursor );
+            if( pthread_mutex_lock( &mqttMutex ) == 0 )
+            {
+                /* Send PUBLISH packet. */
+                packetIdToResend = MQTT_PublishToResend( pMqttContext, &cursor );
+                pthread_mutex_unlock( &mqttMutex );
+            }
+            else
+            {
+                LogError( ( "Failed to acquire mqtt mutex for executing MQTT_PublishToResend"
+                            ",errno=%s",
+                            strerror( errno ) ) );
+            }
         }
     }
 
@@ -943,14 +1020,25 @@ static int handleResubscribe( MQTTContext_t * pMqttContext )
 
     do
     {
-        /* Send SUBSCRIBE packet.
-         * Note: reusing the value specified in globalSubscribePacketIdentifier is acceptable here
-         * because this function is entered only after the receipt of a SUBACK, at which point
-         * its associated packet id is free to use. */
-        mqttStatus = MQTT_Subscribe( pMqttContext,
-                                     pGlobalSubscriptionList,
-                                     sizeof( pGlobalSubscriptionList ) / sizeof( MQTTSubscribeInfo_t ),
-                                     globalSubscribePacketIdentifier );
+        if( pthread_mutex_lock( &mqttMutex ) == 0 )
+        {
+            /* Send SUBSCRIBE packet.
+             * Note: reusing the value specified in globalSubscribePacketIdentifier is acceptable here
+             * because this function is entered only after the receipt of a SUBACK, at which point
+             * its associated packet id is free to use. */
+            mqttStatus = MQTT_Subscribe( pMqttContext,
+                                         pGlobalSubscriptionList,
+                                         sizeof( pGlobalSubscriptionList ) / sizeof( MQTTSubscribeInfo_t ),
+                                         globalSubscribePacketIdentifier );
+
+            pthread_mutex_unlock( &mqttMutex );
+        }
+        else
+        {
+            LogError( ( "Failed to acquire mqtt mutex for executing MQTT_Subscribe"
+                        ",errno=%s",
+                        strerror( errno ) ) );
+        }
 
         if( mqttStatus != MQTTSuccess )
         {
@@ -965,10 +1053,7 @@ static int handleResubscribe( MQTTContext_t * pMqttContext )
                    MQTT_EXAMPLE_TOPIC ) );
 
         /* Process incoming packet. */
-        returnStatus = waitForPacketAck( pMqttContext,
-                                         globalSubscribePacketIdentifier,
-                                         MQTT_PROCESS_LOOP_TIMEOUT_MS );
-
+        returnStatus = waitForPacketAck();
         if( returnStatus == EXIT_FAILURE )
         {
             break;
@@ -1056,6 +1141,11 @@ static void eventCallback( MQTTContext_t * pMqttContext,
 
                 /* Update the global ACK packet identifier. */
                 globalAckPacketIdentifier = packetIdentifier;
+
+                LogInfo( ( "Received SUBACK and release semaphore.\n" ) );
+
+                /* Release Semaphore. */
+                sem_post( &ackSemaphore );
                 break;
 
             case MQTT_PACKET_TYPE_UNSUBACK:
@@ -1067,6 +1157,11 @@ static void eventCallback( MQTTContext_t * pMqttContext,
 
                 /* Update the global ACK packet identifier. */
                 globalAckPacketIdentifier = packetIdentifier;
+
+                LogInfo( ( "Received UNSUBACK and release semaphore.\n" ) );
+
+                /* Release Semaphore. */
+                sem_post( &ackSemaphore );
                 break;
 
             case MQTT_PACKET_TYPE_PINGRESP:
@@ -1085,6 +1180,11 @@ static void eventCallback( MQTTContext_t * pMqttContext,
 
                 /* Update the global ACK packet identifier. */
                 globalAckPacketIdentifier = packetIdentifier;
+
+                LogInfo( ( "Received PUBACK is and release semaphore.\n" ) );
+
+                /* Release Semaphore. */
+                sem_post( &ackSemaphore );
                 break;
 
             /* Any other packet type is invalid. */
@@ -1159,8 +1259,19 @@ static int establishMqttSession( MQTTContext_t * pMqttContext,
         connectInfo.passwordLength = 0U;
     #endif /* ifdef CLIENT_USERNAME */
 
-    /* Send MQTT CONNECT packet to broker. */
-    mqttStatus = MQTT_Connect( pMqttContext, &connectInfo, NULL, CONNACK_RECV_TIMEOUT_MS, pSessionPresent );
+    if( pthread_mutex_lock( &mqttMutex ) == 0 )
+    {
+        /* Send MQTT CONNECT packet to broker. */
+        mqttStatus = MQTT_Connect( pMqttContext, &connectInfo, NULL, CONNACK_RECV_TIMEOUT_MS, pSessionPresent );
+
+        pthread_mutex_unlock( &mqttMutex );
+    }
+    else
+    {
+        LogError( ( "Failed to acquire mutex for executing MQTT_Connect"
+                    ",errno=%s",
+                    strerror( errno ) ) );
+    }
 
     if( mqttStatus != MQTTSuccess )
     {
@@ -1185,14 +1296,31 @@ static int disconnectMqttSession( MQTTContext_t * pMqttContext )
 
     assert( pMqttContext != NULL );
 
-    /* Send DISCONNECT. */
-    mqttStatus = MQTT_Disconnect( pMqttContext );
-
-    if( mqttStatus != MQTTSuccess )
+    if ( mqttSessionEstablished )
     {
-        LogError( ( "Sending MQTT DISCONNECT failed with status=%s.",
-                    MQTT_Status_strerror( mqttStatus ) ) );
-        returnStatus = EXIT_FAILURE;
+        if( pthread_mutex_lock( &mqttMutex ) == 0 )
+        {
+            /* Send DISCONNECT. */
+            mqttStatus = MQTT_Disconnect( pMqttContext );
+
+            /* Clear the mqtt session flag. */
+            mqttSessionEstablished = false;
+
+            pthread_mutex_unlock( &mqttMutex );
+        }
+        else
+        {
+            LogError( ( "Failed to acquire mutex to execute MQTT_Disconnect"
+                        ",errno=%s",
+                        strerror( errno ) ) );
+        }
+
+        if( mqttStatus != MQTTSuccess )
+        {
+            LogError( ( "Sending MQTT DISCONNECT failed with status=%s.",
+                        MQTT_Status_strerror( mqttStatus ) ) );
+            returnStatus = EXIT_FAILURE;
+        }
     }
 
     return returnStatus;
@@ -1218,11 +1346,22 @@ static int subscribeToTopic( MQTTContext_t * pMqttContext )
     /* Generate packet identifier for the SUBSCRIBE packet. */
     globalSubscribePacketIdentifier = MQTT_GetPacketId( pMqttContext );
 
-    /* Send SUBSCRIBE packet. */
-    mqttStatus = MQTT_Subscribe( pMqttContext,
-                                 pGlobalSubscriptionList,
-                                 sizeof( pGlobalSubscriptionList ) / sizeof( MQTTSubscribeInfo_t ),
-                                 globalSubscribePacketIdentifier );
+    if( pthread_mutex_lock( &mqttMutex ) == 0 )
+    {
+        /* Send SUBSCRIBE packet. */
+        mqttStatus = MQTT_Subscribe( pMqttContext,
+                                     pGlobalSubscriptionList,
+                                     sizeof( pGlobalSubscriptionList ) / sizeof( MQTTSubscribeInfo_t ),
+                                     globalSubscribePacketIdentifier );
+
+        pthread_mutex_unlock( &mqttMutex );
+    }
+    else
+    {
+        LogError( ( "Failed to acquire mqtt mutex for executing MQTT_Subscribe"
+                    ",errno=%s",
+                    strerror( errno ) ) );
+    }
 
     if( mqttStatus != MQTTSuccess )
     {
@@ -1261,11 +1400,22 @@ static int unsubscribeFromTopic( MQTTContext_t * pMqttContext )
     /* Generate packet identifier for the UNSUBSCRIBE packet. */
     globalUnsubscribePacketIdentifier = MQTT_GetPacketId( pMqttContext );
 
-    /* Send UNSUBSCRIBE packet. */
-    mqttStatus = MQTT_Unsubscribe( pMqttContext,
-                                   pGlobalSubscriptionList,
-                                   sizeof( pGlobalSubscriptionList ) / sizeof( MQTTSubscribeInfo_t ),
-                                   globalUnsubscribePacketIdentifier );
+
+    if( pthread_mutex_lock( &mqttMutex ) == 0 )
+    {
+        /* Send UNSUBSCRIBE packet. */
+        mqttStatus = MQTT_Unsubscribe( pMqttContext,
+                                       pGlobalSubscriptionList,
+                                       sizeof( pGlobalSubscriptionList ) / sizeof( MQTTSubscribeInfo_t ),
+                                       globalUnsubscribePacketIdentifier );
+        pthread_mutex_unlock( &mqttMutex );
+    }
+    else
+    {
+        LogError( ( "Failed to acquire mutex for executing MQTT_Unsubscribe"
+                    ",errno=%s",
+                    strerror( errno ) ) );
+    }
 
     if( mqttStatus != MQTTSuccess )
     {
@@ -1315,10 +1465,25 @@ static int publishToTopic( MQTTContext_t * pMqttContext )
         /* Get a new packet id. */
         outgoingPublishPackets[ publishIndex ].packetId = MQTT_GetPacketId( pMqttContext );
 
-        /* Send PUBLISH packet. */
-        mqttStatus = MQTT_Publish( pMqttContext,
-                                   &outgoingPublishPackets[ publishIndex ].pubInfo,
-                                   outgoingPublishPackets[ publishIndex ].packetId );
+        if( pthread_mutex_lock( &mqttMutex ) == 0 )
+        {
+            /* Send PUBLISH packet. */
+            mqttStatus = MQTT_Publish( pMqttContext,
+                                       &outgoingPublishPackets[ publishIndex ].pubInfo,
+                                       outgoingPublishPackets[ publishIndex ].packetId );
+            if( mqttStatus != MQTTSuccess )
+            {
+                LogError( ( "Failed to send PUBLISH packet to broker with error = %u.", mqttStatus ) );
+            }
+
+            pthread_mutex_unlock( &mqttMutex );
+        }
+        else
+        {
+            LogError( ( "Failed to acquire mqtt mutex for executing MQTT_Publish"
+                        ",errno=%s",
+                        strerror( errno ) ) );
+        }
 
         if( mqttStatus != MQTTSuccess )
         {
@@ -1333,6 +1498,31 @@ static int publishToTopic( MQTTContext_t * pMqttContext )
                        MQTT_EXAMPLE_TOPIC_LENGTH,
                        MQTT_EXAMPLE_TOPIC,
                        outgoingPublishPackets[ publishIndex ].packetId ) );
+        }
+    }
+
+    return returnStatus;
+}
+
+static int mqttRepublish( void )
+{
+    int returnStatus = EXIT_SUCCESS;
+    int republishCount = 0;
+
+    for ( republishCount = 0; republishCount < MQTT_PUBLISH_RETRY_TIMES; republishCount++ )
+    {
+        LogError( ( "Publish resend, if retry fail three times, need to reconnect to mqtt." ) );
+
+        /* Handle all the resend of publish messages. */
+        returnStatus = handlePublishResend( &mqttContext );
+        if( returnStatus == EXIT_SUCCESS )
+        {
+            /* Wait for PUBACK. */
+            returnStatus = waitForPacketAck();
+            if ( returnStatus == EXIT_SUCCESS )
+            {
+                break;
+            }
         }
     }
 
@@ -1428,9 +1618,7 @@ static int subscribePublishLoop( MQTTContext_t * pMqttContext )
          * of receiving publish message before subscribe ack is zero; but application
          * must be ready to receive any packet. This demo uses MQTT_ProcessLoop to
          * receive packet from network. */
-        returnStatus = waitForPacketAck( pMqttContext,
-                                         globalSubscribePacketIdentifier,
-                                         MQTT_PROCESS_LOOP_TIMEOUT_MS );
+        returnStatus = waitForPacketAck();
     }
 
     /* Check if recent subscription request has been rejected. globalSubAckStatus is updated
@@ -1456,23 +1644,29 @@ static int subscribePublishLoop( MQTTContext_t * pMqttContext )
                        MQTT_EXAMPLE_TOPIC_LENGTH,
                        MQTT_EXAMPLE_TOPIC ) );
             returnStatus = publishToTopic( pMqttContext );
-
-            /* Calling MQTT_ProcessLoop to process incoming publish echo, since
-             * application subscribed to the same topic the broker will send
-             * publish message back to the application. This function also
-             * sends ping request to broker if MQTT_KEEP_ALIVE_INTERVAL_SECONDS
-             * has expired since the last MQTT packet sent and receive
-             * ping responses. */
-            mqttStatus = processLoopWithTimeout( pMqttContext, MQTT_PROCESS_LOOP_TIMEOUT_MS );
-
-            /* For any error in #MQTT_ProcessLoop, exit the loop and disconnect
-             * from the broker. */
-            if( ( mqttStatus != MQTTSuccess ) && ( mqttStatus != MQTTNeedMoreBytes ) )
+            if ( returnStatus == EXIT_SUCCESS )
             {
-                LogError( ( "MQTT_ProcessLoop returned with status = %s.",
-                            MQTT_Status_strerror( mqttStatus ) ) );
-                returnStatus = EXIT_FAILURE;
-                break;
+                /* Calling MQTT_ProcessLoop to process incoming publish echo, since
+                 * application subscribed to the same topic the broker will send
+                 * publish message back to the application. This function also
+                 * sends ping request to broker if MQTT_KEEP_ALIVE_INTERVAL_SECONDS
+                 * has expired since the last MQTT packet sent and receive
+                 * ping responses. */
+                returnStatus = waitForPacketAck();
+                if ( returnStatus != EXIT_SUCCESS )
+                {
+                    /* Resend publish topic, if resends three times fail, to reconnect MQTT broker. */
+                    returnStatus = mqttRepublish();
+
+                    /* For any error in #MQTT_ProcessLoop, exit the loop and disconnect
+                     * from the broker. */
+                    if( returnStatus != EXIT_SUCCESS )
+                    {
+                        LogError( ( "Publish resend retry three times and exit loop and disconnect.") );
+                        returnStatus = EXIT_FAILURE;
+                        break;
+                    }
+                }
             }
 
             LogInfo( ( "Delay before continuing to next iteration.\n\n" ) );
@@ -1494,9 +1688,7 @@ static int subscribePublishLoop( MQTTContext_t * pMqttContext )
     if( returnStatus == EXIT_SUCCESS )
     {
         /* Process Incoming UNSUBACK packet from the broker. */
-        returnStatus = waitForPacketAck( pMqttContext,
-                                         globalUnsubscribePacketIdentifier,
-                                         MQTT_PROCESS_LOOP_TIMEOUT_MS );
+        returnStatus = waitForPacketAck();
     }
 
     /* Send an MQTT Disconnect packet over the already connected TCP socket.
@@ -1525,75 +1717,58 @@ static int subscribePublishLoop( MQTTContext_t * pMqttContext )
 
 /*-----------------------------------------------------------*/
 
-static int waitForPacketAck( MQTTContext_t * pMqttContext,
-                             uint16_t usPacketIdentifier,
-                             uint32_t ulTimeout )
+static int waitForPacketAck( void )
 {
-    uint32_t ulMqttProcessLoopEntryTime;
-    uint32_t ulMqttProcessLoopTimeoutTime;
-    uint32_t ulCurrentTime;
+    int ret = EXIT_SUCCESS;
+    struct timespec ts = { 0 };
 
-    MQTTStatus_t eMqttStatus = MQTTSuccess;
-    int returnStatus = EXIT_FAILURE;
+    /* Calculate relative interval as current time plus number of seconds. */
+    clock_gettime( CLOCK_REALTIME, &ts );
+    ts.tv_sec += MQTT_ACK_TIMEOUT_SEC;
 
-    /* Reset the ACK packet identifier being received. */
-    globalAckPacketIdentifier = 0U;
-
-    ulCurrentTime = pMqttContext->getTime();
-    ulMqttProcessLoopEntryTime = ulCurrentTime;
-    ulMqttProcessLoopTimeoutTime = ulCurrentTime + ulTimeout;
-
-    /* Call MQTT_ProcessLoop multiple times until the expected packet ACK
-     * is received, a timeout happens, or MQTT_ProcessLoop fails. */
-    while( ( globalAckPacketIdentifier != usPacketIdentifier ) &&
-           ( ulCurrentTime < ulMqttProcessLoopTimeoutTime ) &&
-           ( eMqttStatus == MQTTSuccess || eMqttStatus == MQTTNeedMoreBytes ) )
+    while( ( ret = sem_timedwait( &ackSemaphore, &ts ) ) == -1 && errno == EINTR )
     {
-        /* Event callback will set #globalAckPacketIdentifier when receiving
-         * appropriate packet. */
-        eMqttStatus = MQTT_ProcessLoop( pMqttContext );
-        ulCurrentTime = pMqttContext->getTime();
+        continue;
     }
 
-    if( ( ( eMqttStatus != MQTTSuccess ) && ( eMqttStatus != MQTTNeedMoreBytes ) ) ||
-        ( globalAckPacketIdentifier != usPacketIdentifier ) )
-    {
-        LogError( ( "MQTT_ProcessLoop failed to receive ACK packet: Expected ACK Packet ID=%02X, LoopDuration=%u, Status=%s",
-                    usPacketIdentifier,
-                    ( ulCurrentTime - ulMqttProcessLoopEntryTime ),
-                    MQTT_Status_strerror( eMqttStatus ) ) );
-    }
-    else
-    {
-        returnStatus = EXIT_SUCCESS;
-    }
-
-    return returnStatus;
+    return ( ( ret == 0 ) ? EXIT_SUCCESS : EXIT_FAILURE );
 }
 
 /*-----------------------------------------------------------*/
 
-static MQTTStatus_t processLoopWithTimeout( MQTTContext_t * pMqttContext,
-                                            uint32_t ulTimeoutMs )
+static void * processMqttLoopThread( void * pParam )
 {
-    uint32_t ulMqttProcessLoopTimeoutTime;
-    uint32_t ulCurrentTime;
-
     MQTTStatus_t eMqttStatus = MQTTSuccess;
 
-    ulCurrentTime = pMqttContext->getTime();
-    ulMqttProcessLoopTimeoutTime = ulCurrentTime + ulTimeoutMs;
-
-    /* Call MQTT_ProcessLoop multiple times a timeout happens, or
-     * MQTT_ProcessLoop fails. */
-    while( ( ulCurrentTime < ulMqttProcessLoopTimeoutTime ) &&
-           ( eMqttStatus == MQTTSuccess || eMqttStatus == MQTTNeedMoreBytes ) )
+    while ( mqttProcessLoop )
     {
-        eMqttStatus = MQTT_ProcessLoop( pMqttContext );
-        ulCurrentTime = pMqttContext->getTime();
+        /* The mqtt connection is sucessful, MQTT_ProcessLoop is still call. */
+        if( mqttSessionEstablished )
+        {
+            /* Acquire the mqtt mutex lock. */
+            if( pthread_mutex_lock( &mqttMutex ) == 0 )
+            {
+                eMqttStatus = MQTT_ProcessLoop( &mqttContext );
+                if ( eMqttStatus != MQTTSuccess)
+                {
+                    LogError( ( "Mqtt process loop error and return value is %d.\n\n",
+                               eMqttStatus ) );
+                }
+
+                pthread_mutex_unlock( &mqttMutex );
+            }
+            else
+            {
+                LogError( ( "Failed to acquire mutex to execute MQTT_ProcessLoop"
+                            ",errno=%s",
+                            strerror( errno ) ) );
+            }
+        }
+
+        usleep( MQTT_PROCESS_LOOP_TIME_USEC );
     }
 
-    return eMqttStatus;
+    return NULL;
 }
 
 /*-----------------------------------------------------------*/
@@ -1612,15 +1787,19 @@ static MQTTStatus_t processLoopWithTimeout( MQTTContext_t * pMqttContext,
  * are resent in this demo. In order to support retransmission all the outgoing
  * publishes are stored until a PUBACK is received.
  */
-int main( int argc,
-          char ** argv )
+int main( int argc, char ** argv )
 {
     int returnStatus = EXIT_SUCCESS;
-    MQTTContext_t mqttContext = { 0 };
-    NetworkContext_t networkContext = { 0 };
     OpensslParams_t opensslParams = { 0 };
     bool clientSessionPresent = false, brokerSessionPresent = false;
     struct timespec tp;
+    bool mqttMutexInitialized = false;
+
+    /* Status return from call to pthread_join. */
+    int returnJoin = 0;
+
+    /* Mqtt process loop thread handle.*/
+    pthread_t mqttProcessLoopHandle;
 
     ( void ) argc;
     ( void ) argv;
@@ -1636,72 +1815,156 @@ int main( int argc,
     /* Seed pseudo random number generator with nanoseconds. */
     srand( tp.tv_nsec );
 
-    /* Initialize MQTT library. Initialization of the MQTT library needs to be
-     * done only once in this demo. */
-    returnStatus = initializeMqtt( &mqttContext, &networkContext );
+    /* Initialize semaphore for ack. */
+    if( sem_init( &ackSemaphore, 0, 0 ) != 0 )
+    {
+        LogError( ( "Failed to initialize ack semaphore"
+                    ",errno=%s",
+                    strerror( errno ) ) );
+
+        returnStatus = EXIT_FAILURE;
+    }
+
+    /* Initialize mutex for coreMQTT APIs. */
+    if( pthread_mutex_init( &mqttMutex, NULL ) != 0 )
+    {
+        LogError( ( "Failed to initialize mutex for mqtt apis"
+                    ",errno=%s",
+                    strerror( errno ) ) );
+
+        returnStatus = EXIT_FAILURE;
+    }
+    else
+    {
+        mqttMutexInitialized = true;
+    }
+
+    /* Create mqtt process loop Task. */
+    if( returnStatus == EXIT_SUCCESS )
+    {
+        if( pthread_create( &mqttProcessLoopHandle, NULL, processMqttLoopThread, &mqttContext ) != 0 )
+        {
+            LogError( ( "Failed to create mqtt process loop thread: "
+                        ",errno=%s",
+                        strerror( errno ) ) );
+
+            returnStatus = EXIT_FAILURE;
+        }
+    }
 
     if( returnStatus == EXIT_SUCCESS )
     {
-        for( ; ; )
+        /* Initialize MQTT library. Initialization of the MQTT library needs to be
+         * done only once in this demo. */
+        returnStatus = initializeMqtt( &mqttContext, &networkContext );
+        if( returnStatus == EXIT_SUCCESS )
         {
-            /* Attempt to connect to the MQTT broker. If connection fails, retry after
-             * a timeout. Timeout value will be exponentially increased till the maximum
-             * attempts are reached or maximum timeout value is reached. The function
-             * returns EXIT_FAILURE if the TCP connection cannot be established to
-             * broker after configured number of attempts. */
-            returnStatus = connectToServerWithBackoffRetries( &networkContext, &mqttContext, &clientSessionPresent, &brokerSessionPresent );
-
-            if( returnStatus == EXIT_FAILURE )
+            for( ; ; )
             {
-                /* Log error to indicate connection failure after all
-                 * reconnect attempts are over. */
-                LogError( ( "Failed to connect to MQTT broker %.*s.",
-                            AWS_IOT_ENDPOINT_LENGTH,
-                            AWS_IOT_ENDPOINT ) );
-            }
-            else
-            {
-                /* Update the flag to indicate that an MQTT client session is saved.
-                 * Once this flag is set, MQTT connect in the following iterations of
-                 * this demo will be attempted without requesting for a clean session. */
-                clientSessionPresent = true;
+                /* Attempt to connect to the MQTT broker. If connection fails, retry after
+                 * a timeout. Timeout value will be exponentially increased till the maximum
+                 * attempts are reached or maximum timeout value is reached. The function
+                 * returns EXIT_FAILURE if the TCP connection cannot be established to
+                 * broker after configured number of attempts. */
+                returnStatus = connectToServerWithBackoffRetries( &networkContext,
+                                                                  &mqttContext,
+                                                                  &clientSessionPresent,
+                                                                  &brokerSessionPresent );
 
-                /* Check if session is present and if there are any outgoing publishes
-                 * that need to resend. This is only valid if the broker is
-                 * re-establishing a session which was already present. */
-                if( brokerSessionPresent == true )
+                if( returnStatus == EXIT_FAILURE )
                 {
-                    LogInfo( ( "An MQTT session with broker is re-established. "
-                               "Resending unacked publishes." ) );
-
-                    /* Handle all the resend of publish messages. */
-                    returnStatus = handlePublishResend( &mqttContext );
+                    /* Log error to indicate connection failure after all
+                     * reconnect attempts are over. */
+                    LogError( ( "Failed to connect to MQTT broker %.*s.",
+                                AWS_IOT_ENDPOINT_LENGTH,
+                                AWS_IOT_ENDPOINT ) );
                 }
                 else
                 {
-                    LogInfo( ( "A clean MQTT connection is established."
-                               " Cleaning up all the stored outgoing publishes.\n\n" ) );
+                    /* Update the flag to indicate that an MQTT client session is saved.
+                     * Once this flag is set, MQTT connect in the following iterations of
+                     * this demo will be attempted without requesting for a clean session. */
+                    clientSessionPresent = true;
+                    mqttSessionEstablished = true;
 
-                    /* Clean up the outgoing publishes waiting for ack as this new
-                     * connection doesn't re-establish an existing session. */
-                    cleanupOutgoingPublishes();
+                    /* Check if session is present and if there are any outgoing publishes
+                     * that need to resend. This is only valid if the broker is
+                     * re-establishing a session which was already present. */
+                    if( brokerSessionPresent == true )
+                    {
+                        LogInfo( ( "An MQTT session with broker is re-established. "
+                                   "Resending unacked publishes." ) );
+
+                        /* Handle all the resend of publish messages. */
+                        returnStatus = handlePublishResend( &mqttContext );
+                    }
+                    else
+                    {
+                        LogInfo( ( "A clean MQTT connection is established."
+                                   " Cleaning up all the stored outgoing publishes.\n\n" ) );
+
+                        /* Clean up the outgoing publishes waiting for ack as this new
+                         * connection doesn't re-establish an existing session. */
+                        cleanupOutgoingPublishes();
+                    }
+
+                    /* If TLS session is established, execute Subscribe/Publish loop. */
+                    returnStatus = subscribePublishLoop( &mqttContext );
+
+                    /* End TLS session, then close TCP connection. */
+                    ( void ) Openssl_Disconnect( &networkContext );
                 }
 
-                /* If TLS session is established, execute Subscribe/Publish loop. */
-                returnStatus = subscribePublishLoop( &mqttContext );
+                if( returnStatus == EXIT_SUCCESS )
+                {
+                    /* Log message indicating an iteration completed successfully. */
+                    LogInfo( ( "Demo completed successfully." ) );
+                }
 
-                /* End TLS session, then close TCP connection. */
-                ( void ) Openssl_Disconnect( &networkContext );
+                LogInfo( ( "Short delay before starting the next iteration....\n" ) );
+                sleep( MQTT_SUBPUB_LOOP_DELAY_SECONDS );
             }
+        }
+    }
 
-            if( returnStatus == EXIT_SUCCESS )
-            {
-                /* Log message indicating an iteration completed successfully. */
-                LogInfo( ( "Demo completed successfully." ) );
-            }
+    /* Cleanup semaphore created for pub ack operations. */
+    if( sem_destroy( &ackSemaphore ) != 0 )
+    {
+        LogError( ( "Failed to destroy ack semaphore"
+                    ",errno=%s",
+                    strerror( errno ) ) );
+        returnStatus = EXIT_FAILURE;
+    }
 
-            LogInfo( ( "Short delay before starting the next iteration....\n" ) );
-            sleep( MQTT_SUBPUB_LOOP_DELAY_SECONDS );
+    if( mqttMutexInitialized == true )
+    {
+        /* Cleanup mutex created for MQTT operations. */
+        if( pthread_mutex_destroy( &mqttMutex ) != 0 )
+        {
+            LogError( ( "Failed to destroy mutex for mqtt apis"
+                        ",errno=%s",
+                        strerror( errno ) ) );
+
+            returnStatus = EXIT_FAILURE;
+        }
+        else
+        {
+            mqttMutexInitialized = false;
+        }
+    }
+
+    if( returnStatus == EXIT_SUCCESS )
+    {
+        mqttProcessLoop = false;
+        returnJoin = pthread_join( mqttProcessLoopHandle, NULL );
+
+        if( returnJoin != 0 )
+        {
+            LogError( ( "Failed to join thread"
+                        ",error code = %d",
+                        returnJoin ) );
+
+            returnStatus = EXIT_FAILURE;
         }
     }
 
