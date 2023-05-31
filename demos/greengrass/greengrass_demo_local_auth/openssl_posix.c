@@ -242,6 +242,8 @@ static OpensslStatus_t tlsHandshake( const ServerInfo_t * pServerInfo,
 {
     OpensslStatus_t returnStatus = OPENSSL_SUCCESS;
     int32_t sslStatus = -1;
+    int isContinue = 1;
+    int iret = 0;
 
     /* This is not used in this demo, but is left to keep the signature same
      * between demos. */
@@ -268,12 +270,22 @@ static OpensslStatus_t tlsHandshake( const ServerInfo_t * pServerInfo,
     {
         setOptionalConfigurations( pOpensslParams->pSsl, pOpensslCredentials );
 
-        sslStatus = SSL_connect( pOpensslParams->pSsl );
-
-        if( sslStatus != 1 )
+        while ( isContinue )
         {
-            LogError( ( "SSL_connect failed to perform TLS handshake." ) );
-            returnStatus = OPENSSL_HANDSHAKE_FAILED;
+            isContinue = 0;
+            sslStatus = SSL_connect( pOpensslParams->pSsl );
+            if (sslStatus != 1)
+            {
+                iret = SSL_get_error( pOpensslParams->pSsl, sslStatus );
+                if ( iret == SSL_ERROR_WANT_WRITE || iret == SSL_ERROR_WANT_READ )
+                {
+                    isContinue = 1;
+                }
+                else
+                {
+                    break;
+                }
+            }
         }
     }
 

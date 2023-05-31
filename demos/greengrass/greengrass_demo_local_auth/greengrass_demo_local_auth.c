@@ -112,7 +112,7 @@
 /**
  * @brief Timeout for receiving CONNACK packet in milli seconds.
  */
-#define CONNACK_RECV_TIMEOUT_MS             ( 1000U )
+#define CONNACK_RECV_TIMEOUT_MS             ( 2000U )
 
 /**
  * @brief Maximum number of outgoing publishes maintained in the application
